@@ -794,6 +794,133 @@ local function scheduleGameThreadDelay(delayMs, fn)
     end
 end
 
+-- ===== Head smoothing, ground-hit tick lock and custom camera collision =====
+local FPP_HEAD_SMOOTH_TAU = 0.06
+local FPP_EYE_PAD = 25.0
+local FPP_WALL_MARGIN = 14.0
+local FPP_GROUND_PITCH = -30.0
+local smoothPitch, smoothYaw = nil, nil
+local smoothLastClock = nil
+local springTickDisabled = false
+local camPulled = false
+local collisionDisabled = false
+local COL_TARGET = { X = 0.0, Y = 0.0, Z = 0.0 }
+local COL_START = { X = 0.0, Y = 0.0, Z = 0.0 }
+local COL_END = { X = 0.0, Y = 0.0, Z = 0.0 }
+local COL_COLOR = { R = 0.0, G = 0.0, B = 0.0, A = 0.0 }
+local COL_HIT = {}
+local ksl = nil
+
+local function resetSmoothing()
+    smoothPitch, smoothYaw, smoothLastClock = nil, nil, nil
+end
+
+local function smoothRotationTbl()
+    local now = os.clock()
+    local p, y = ROT_TBL.Pitch, ROT_TBL.Yaw
+    if smoothPitch == nil or smoothLastClock == nil then
+        smoothPitch, smoothYaw, smoothLastClock = p, y, now
+        return
+    end
+    local dt = now - smoothLastClock
+    smoothLastClock = now
+    if dt < 0 then dt = 0 end
+    if dt > 0.25 then dt = 0.25 end
+    local dy = ((y - smoothYaw + 540.0) % 360.0) - 180.0
+    local dp = p - smoothPitch
+    if math.abs(dy) > 45.0 or math.abs(dp) > 45.0 then
+        smoothPitch, smoothYaw = p, y
+        return
+    end
+    local alpha = 1.0 - math.exp(-dt / FPP_HEAD_SMOOTH_TAU)
+    smoothPitch = smoothPitch + dp * alpha
+    smoothYaw = smoothYaw + dy * alpha
+    ROT_TBL.Pitch = smoothPitch
+    ROT_TBL.Yaw = smoothYaw
+end
+
+local function setSpringTickEnabled(springArm, enabled)
+    if enabled == (not springTickDisabled) then
+        return
+    end
+    local ok = pcall(function()
+        springArm:SetComponentTickEnabled(enabled)
+    end)
+    if ok then
+        springTickDisabled = not enabled
+    end
+end
+
+local function updateGroundTickLock(springArm)
+    if ROT_TBL.Pitch <= FPP_GROUND_PITCH and ROT_TBL.Pitch > -89.9 then
+        setSpringTickEnabled(springArm, false)
+    else
+        setSpringTickEnabled(springArm, true)
+    end
+end
+
+local function updateCameraCollision(char, mesh, springArm)
+    if collisionDisabled then
+        return
+    end
+    local ok, err = pcall(function()
+        if not ksl then
+            ksl = StaticFindObject('/Script/Engine.Default__KismetSystemLibrary')
+        end
+        if not ksl or not ksl:IsValid() then
+            collisionDisabled = true
+            Logger.warn('FPP collision: KismetSystemLibrary not found; disabled')
+            return
+        end
+        local head = mesh:GetSocketLocation(FName(HEAD_BONE_NAME))
+        local loc = char:K2_GetActorLocation()
+        local hx, hy, hz = head.X, head.Y, head.Z
+        local pr = math.rad(ROT_TBL.Pitch)
+        local yr = math.rad(ROT_TBL.Yaw)
+        local fx = math.cos(pr) * math.cos(yr)
+        local fy = math.cos(pr) * math.sin(yr)
+        local fz = math.sin(pr)
+        COL_START.X, COL_START.Y, COL_START.Z = loc.X, loc.Y, hz
+        COL_END.X = hx + fx * FPP_EYE_PAD
+        COL_END.Y = hy + fy * FPP_EYE_PAD
+        COL_END.Z = hz + fz * FPP_EYE_PAD
+        local hit = ksl:LineTraceSingle(char, COL_START, COL_END, 0, false, { char }, 0, COL_HIT, true, COL_COLOR, COL_COLOR, 0.0)
+        local pull = 0.0
+        if hit == true then
+            local dx, dy, dz = COL_END.X - COL_START.X, COL_END.Y - COL_START.Y, COL_END.Z - COL_START.Z
+            local total = math.sqrt(dx * dx + dy * dy + dz * dz)
+            local d = nil
+            local okD, val = pcall(function() return COL_HIT.Distance end)
+            if okD and type(val) == 'number' then d = val end
+            if d == nil then
+                local okH, hv = pcall(function() return COL_HIT.Distance end)
+                if okH and type(hv) == 'number' then d = hv end
+            end
+            if d == nil then
+                collisionDisabled = true
+                Logger.warn('FPP collision: cannot read hit distance; disabled')
+                return
+            end
+            pull = (total - d) + FPP_WALL_MARGIN
+            if pull < 0 then pull = 0 end
+            if pull > 60.0 then pull = 60.0 end
+        end
+        if pull > 0.5 then
+            COL_TARGET.X = hx - fx * pull
+            COL_TARGET.Y = hy - fy * pull
+            COL_TARGET.Z = hz - fz * pull
+            springArm:K2_SetWorldLocation(COL_TARGET, false, EMPTY_HIT, true)
+            camPulled = true
+        elseif camPulled then
+            springArm:K2_SetRelativeLocation(ZERO_VEC, false, EMPTY_HIT, true)
+            camPulled = false
+        end
+    end)
+    if not ok then
+        collisionDisabled = true
+        Logger.warn('FPP collision error, disabled: %s', tostring(err))
+    end
+end
 local function applyRotationSyncOnGameThread()
     if not fppHeadEnabled or thirdPersonActive or (Hooks.isInCinematic and Hooks.isInCinematic()) then
         return
@@ -826,6 +953,10 @@ local function applyRotationSyncOnGameThread()
             springArm.SocketOffset = ZERO_VEC
         end
     end)
+
+    smoothRotationTbl()
+    updateGroundTickLock(springArm)
+    updateCameraCollision(char, mesh, springArm)
 
     local armAddr = getObjectKey(springArm)
     rotSyncTickCounter = rotSyncTickCounter + 1
@@ -863,6 +994,8 @@ local function applyFPPHeadTrackingOnGameThread()
 
     if isThirdPersonOrCutscene(char, mesh, springArm, trackedPC) then
         thirdPersonActive = true
+        setSpringTickEnabled(springArm, true)
+        resetSmoothing()
         return
     end
     thirdPersonActive = false
@@ -929,6 +1062,9 @@ local function restoreFPPHeadTrackingOnGameThread()
     syncTrackedCharacter(char, mesh, springArm, view)
     ensureViewUnderRoot(char, view, mesh)
 
+    setSpringTickEnabled(springArm, true)
+    camPulled = false
+    resetSmoothing()
     local armAddr = getObjectKey(springArm)
     pcall(function()
         springArm.bUsePawnControlRotation = false
