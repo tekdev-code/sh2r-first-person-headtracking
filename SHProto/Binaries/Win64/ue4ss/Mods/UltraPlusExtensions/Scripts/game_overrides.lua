@@ -457,13 +457,15 @@ local trackedView = nil
 local trackedPC = nil
 local trackedCam = nil
 local trackedCamAnimMod = nil
+local trackedPCM = nil
+local trackedCombat = nil
+local trackedRangedSub = nil
+local camClassCache = nil
 local camAnimSearchCooldown = 0
 local origParent = nil
 local origCamParent = nil
 local origCamSocketName = nil
-local origCamAbsLoc = nil
 local origCamAbsRot = nil
-local origCamAbsScale = nil
 local origSpringArmAddr = nil
 local origDoCollisionTest = nil
 local origCameraLag = nil
@@ -488,6 +490,14 @@ local ROT_TBL = {Pitch = 0.0, Yaw = 0.0, Roll = 0.0}
 local EMPTY_HIT = {}
 local COL_IGNORE = nil
 local COL_IGNORE_KEY = nil
+local COL_IGNORE_WEAP_KEY = nil
+local ATTACHED_ARR = {}
+
+local function clearTable(tbl)
+    for k in pairs(tbl) do
+        tbl[k] = nil
+    end
+end
 
 local function resetLastSyncRotation()
     lastSyncArmAddr = nil
@@ -507,9 +517,7 @@ local function clearSpringArmBackup()
     origSocketOffset = nil
     origCamParent = nil
     origCamSocketName = nil
-    origCamAbsLoc = nil
     origCamAbsRot = nil
-    origCamAbsScale = nil
 end
 
 local function isValidUObject(obj)
@@ -569,9 +577,13 @@ local function clearTrackedCache()
     trackedPC = nil
     trackedCam = nil
     trackedCamAnimMod = nil
+    trackedPCM = nil
+    trackedCombat = nil
+    trackedRangedSub = nil
     camAnimSearchCooldown = 0
     COL_IGNORE = nil
     COL_IGNORE_KEY = nil
+    COL_IGNORE_WEAP_KEY = nil
     resetLastSyncRotation()
     clearSpringArmBackup()
 end
@@ -691,9 +703,13 @@ local function syncTrackedCharacter(char, mesh, springArm, view)
         origParent = nil
         trackedCam = nil
         trackedCamAnimMod = nil
+        trackedPCM = nil
+        trackedCombat = nil
+        trackedRangedSub = nil
         camAnimSearchCooldown = 0
         COL_IGNORE = nil
         COL_IGNORE_KEY = nil
+        COL_IGNORE_WEAP_KEY = nil
         thirdPersonActive = false
         clearSpringArmBackup()
     end
@@ -743,7 +759,9 @@ local function ensureViewUnderRoot(char, view, mesh)
             end)
         end
         pcall(function()
+            clearTable(EMPTY_HIT)
             view:K2_SetRelativeLocation(DEFAULT_VIEW_LOC, false, EMPTY_HIT, true)
+            clearTable(EMPTY_HIT)
         end)
     end
 end
@@ -824,17 +842,22 @@ local function scheduleGameThreadDelay(delayMs, fn)
     end
 end
 
--- ===== Head smoothing, camera detach, lateral clamp, combat anim stop & sphere collision =====
-local FPP_HEAD_SMOOTH_TAU = 0.06
+-- ===== Head smoothing, camera detach, melee clamp/collision, combat anim/shake stop & ADS =====
 local FPP_POS_SMOOTH_TAU = 0.045
 local FPP_MAX_HEAD_LATERAL = 6.0
-local FPP_EYE_PROBE = 16.0
-local FPP_SPHERE_RADIUS = 12.0
-local FPP_WALL_BUFFER = 4.0
-local FPP_MAX_COL_PULLBACK = 18.0
+local FPP_MIN_HEAD_Z = 36.0
+local FPP_MAX_HEAD_Z = 76.0
+local FPP_EYE_PROBE = 10.0
+local FPP_SPHERE_RADIUS = 6.5
+local FPP_WALL_BUFFER = 3.0
+local FPP_MAX_COL_PULLBACK = 4.0
 local FPP_TELEPORT_SNAP_SQ = 6400.0
-local smoothPitch, smoothYaw = nil, nil
-local smoothLastClock = nil
+local FPP_AIM_BLEND_TAU = 0.08
+local FPP_AIM_FWD = 8.0
+local FPP_AIM_RIGHT = 4.5
+local FPP_AIM_UP = -3.0
+local aimBlend = 0.0
+local aimClock = nil
 local smoothOffX, smoothOffY, smoothOffZ = nil, nil, nil
 local smoothPosClock = nil
 local lastCapX, lastCapY, lastCapZ = nil, nil, nil
@@ -847,25 +870,95 @@ local COL_COLOR = { R = 0.0, G = 0.0, B = 0.0, A = 0.0 }
 local COL_HIT = {}
 local ksl = nil
 
-local function getCharacterCamera(char)
+local function isCameraComponentCandidate(comp, springArm)
+    if not isNonDefaultUObject(comp) then
+        return false
+    end
+    if isSameUObject(comp, springArm) then
+        return false
+    end
+    if camClassCache and isValidUObject(camClassCache) then
+        local okIsA, isA = pcall(function()
+            return comp:IsA(camClassCache)
+        end)
+        if okIsA then
+            return isA == true
+        end
+    end
+    local okName, fullName = pcall(function()
+        return comp:GetFullName()
+    end)
+    if okName and type(fullName) == 'string' then
+        if fullName:find('OverlapHandler', 1, true) then
+            return false
+        end
+        return fullName:find('CameraComponent', 1, true) ~= nil
+    end
+    return false
+end
+
+local function getCharacterCamera(char, springArm)
     if isValidUObject(trackedCam) then
         return trackedCam
     end
     if not isValidUObject(char) then
         return nil
     end
-    local ok, cam = pcall(function()
-        return char:GetSHCameraComponent()
-    end)
-    if ok and isValidUObject(cam) then
-        trackedCam = cam
-        return cam
+    if not camClassCache and StaticFindObject then
+        pcall(function()
+            camClassCache = StaticFindObject('/Script/Engine.CameraComponent')
+        end)
+    end
+    if isValidUObject(springArm) then
+        local count = 0
+        pcall(function()
+            count = springArm:GetNumChildrenComponents() or 0
+        end)
+        for i = 0, count - 1 do
+            local okChild, child = pcall(function()
+                return springArm:GetChildComponent(i)
+            end)
+            if okChild and isCameraComponentCandidate(child, springArm) then
+                trackedCam = child
+                return child
+            end
+        end
+    end
+    for _, propName in ipairs({'Camera', 'CameraComponent'}) do
+        local okProp, comp = pcall(function()
+            return char[propName]
+        end)
+        if okProp and isCameraComponentCandidate(comp, springArm) then
+            trackedCam = comp
+            return comp
+        end
+    end
+    if camClassCache and isValidUObject(camClassCache) then
+        local foundCam = nil
+        pcall(function()
+            local comps = char:K2_GetComponentsByClass(camClassCache)
+            if type(comps) == 'table' then
+                foundCam = comps[1]
+            elseif comps and comps.ForEach then
+                comps:ForEach(function(_, elem)
+                    if not foundCam and isValidUObject(elem) then
+                        foundCam = elem:get() or elem
+                    end
+                end)
+            elseif comps then
+                foundCam = comps[1]
+            end
+        end)
+        if isCameraComponentCandidate(foundCam, springArm) then
+            trackedCam = foundCam
+            return foundCam
+        end
     end
     return nil
 end
 
 local function attachCameraForFPP(char, springArm)
-    local cam = getCharacterCamera(char)
+    local cam = getCharacterCamera(char, springArm)
     if not isValidUObject(cam) or not isValidUObject(springArm) then
         return
     end
@@ -881,8 +974,8 @@ local function attachCameraForFPP(char, springArm)
     if not okStr then
         curSockStr = NONE_NAME
     end
-    local okAbs, absLoc, absRot, absScale = pcall(function()
-        return cam.bAbsoluteLocation, cam.bAbsoluteRotation, cam.bAbsoluteScale
+    local okAbsRot, absRot = pcall(function()
+        return cam.bAbsoluteRotation
     end)
     if origCamSocketName == nil and isValidUObject(curParent) then
         origCamParent = curParent
@@ -891,17 +984,13 @@ local function attachCameraForFPP(char, springArm)
         else
             origCamSocketName = SPRING_ENDPOINT_NAME
         end
-        if okAbs then
-            origCamAbsLoc = (absLoc == true)
+        if okAbsRot then
             origCamAbsRot = (absRot == true)
-            origCamAbsScale = (absScale == true)
         end
     end
-    if okAbs and (absLoc ~= true or absRot ~= true or absScale ~= true) then
-        pcall(function()
-            cam:SetAbsolute(true, true, true)
-        end)
-    end
+    pcall(function()
+        cam:SetAbsolute(true, true, true)
+    end)
     if not isSameUObject(curParent, springArm) or curSockStr ~= NONE_NAME then
         pcall(function()
             cam:K2_AttachToComponent(springArm, FName(NONE_NAME), 2, 2, 1, false)
@@ -911,7 +1000,7 @@ local function attachCameraForFPP(char, springArm)
 end
 
 local function restoreCameraFromFPP(char, springArm)
-    local cam = getCharacterCamera(char)
+    local cam = getCharacterCamera(char, springArm)
     if not isValidUObject(cam) then
         return
     end
@@ -934,15 +1023,41 @@ local function restoreCameraFromFPP(char, springArm)
     end
     if origCamSocketName ~= nil or not okAttach or not isSameUObject(curParent, targetParent) or curSockStr ~= targetSock then
         pcall(function()
-            cam:SetAbsolute(origCamAbsLoc == true, origCamAbsRot == true, origCamAbsScale == true)
+            cam:SetAbsolute(false, origCamAbsRot == true, false)
             cam:K2_AttachToComponent(targetParent, FName(targetSock), 2, 2, 1, false)
+            clearTable(EMPTY_HIT)
             cam:K2_SetRelativeLocation(ZERO_VEC, false, EMPTY_HIT, true)
+            clearTable(EMPTY_HIT)
             cam:K2_SetRelativeRotation(ZERO_ROT, false, EMPTY_HIT, true)
+            clearTable(EMPTY_HIT)
         end)
     end
 end
 
+local function getActiveCameraManager()
+    if isNonDefaultUObject(trackedPCM) then
+        return trackedPCM
+    end
+    trackedPCM = nil
+    if isValidUObject(trackedPC) then
+        local ok, pcm = pcall(function()
+            return trackedPC.PlayerCameraManager
+        end)
+        if ok and isNonDefaultUObject(pcm) then
+            trackedPCM = pcm
+            return pcm
+        end
+    end
+    return nil
+end
+
 local function stopCombatCameraAnimations()
+    local pcm = getActiveCameraManager()
+    if pcm then
+        pcall(function()
+            pcm:StopAllCameraShakes(true)
+        end)
+    end
     if not isNonDefaultUObject(trackedCamAnimMod) then
         trackedCamAnimMod = nil
         if camAnimSearchCooldown > 0 then
@@ -976,34 +1091,15 @@ local function stopCombatCameraAnimations()
 end
 
 local function resetSmoothing()
-    smoothPitch, smoothYaw, smoothLastClock = nil, nil, nil
     smoothOffX, smoothOffY, smoothOffZ = nil, nil, nil
     smoothPosClock = nil
     lastCapX, lastCapY, lastCapZ = nil, nil, nil
+    aimBlend = 0.0
+    aimClock = nil
 end
 
 local function smoothRotationTbl()
-    local now = os.clock()
-    local p, y = ROT_TBL.Pitch, ROT_TBL.Yaw
-    if smoothPitch == nil or smoothLastClock == nil then
-        smoothPitch, smoothYaw, smoothLastClock = p, y, now
-        return
-    end
-    local dt = now - smoothLastClock
-    smoothLastClock = now
-    if dt < 0 then dt = 0 end
-    if dt > 0.25 then dt = 0.25 end
-    local dy = ((y - smoothYaw + 540.0) % 360.0) - 180.0
-    local dp = p - smoothPitch
-    if math.abs(dy) > 45.0 or math.abs(dp) > 45.0 then
-        smoothPitch, smoothYaw = p, y
-        return
-    end
-    local alpha = 1.0 - math.exp(-dt / FPP_HEAD_SMOOTH_TAU)
-    smoothPitch = smoothPitch + dp * alpha
-    smoothYaw = smoothYaw + dy * alpha
-    ROT_TBL.Pitch = smoothPitch
-    ROT_TBL.Yaw = smoothYaw
+    ROT_TBL.Roll = 0.0
 end
 
 local function setSpringTickEnabled(springArm, enabled)
@@ -1048,6 +1144,156 @@ local function readTraceDistance(total)
     return d
 end
 
+local applyFPPHeadTrackingOnGameThread
+
+local function getRangedSubcomponent(char)
+    if isNonDefaultUObject(trackedRangedSub) then
+        return trackedRangedSub
+    end
+    trackedRangedSub = nil
+    if not isNonDefaultUObject(trackedCombat) then
+        trackedCombat = nil
+        if not isValidUObject(char) then
+            return nil
+        end
+        pcall(function()
+            if isNonDefaultUObject(char.Combat) then
+                trackedCombat = char.Combat
+            end
+        end)
+    end
+    if isNonDefaultUObject(trackedCombat) then
+        pcall(function()
+            if isNonDefaultUObject(trackedCombat.RangedCombatSubcomponent) then
+                trackedRangedSub = trackedCombat.RangedCombatSubcomponent
+            end
+        end)
+    end
+    return trackedRangedSub
+end
+
+local function isCharacterInRangedAim(char)
+    if not isValidUObject(char) then
+        return false
+    end
+    local rangedSub = getRangedSubcomponent(char)
+    if isNonDefaultUObject(rangedSub) then
+        local okSub, aiming = pcall(function()
+            return rangedSub:IsInRangedAim()
+        end)
+        if okSub then
+            return aiming == true
+        end
+    end
+    local okChar, aimingChar = pcall(function()
+        return char:IsInRangedAim()
+    end)
+    return okChar and aimingChar == true
+end
+
+local function getEquippedWeapons(char)
+    local weap, rangedWeap = nil, nil
+    if isValidUObject(char) then
+        local okW, w = pcall(function()
+            return char:GetEquippedWeapon()
+        end)
+        if okW and isValidUObject(w) then
+            weap = w
+        end
+    end
+    local rangedSub = getRangedSubcomponent(char)
+    if isNonDefaultUObject(rangedSub) then
+        local okRW, rw = pcall(function()
+            return rangedSub:GetEquippedRangedWeapon()
+        end)
+        if okRW and isValidUObject(rw) then
+            rangedWeap = rw
+        end
+    end
+    return weap, rangedWeap
+end
+
+local function addUniqueActor(list, seen, actor)
+    if not isValidUObject(actor) then
+        return
+    end
+    local key = getObjectKey(actor) or tostring(actor)
+    if not seen[key] then
+        seen[key] = true
+        list[#list + 1] = actor
+    end
+end
+
+local function collectAttachedActors(char, list, seen)
+    pcall(function()
+        clearTable(ATTACHED_ARR)
+        local ret = char:GetAllAttachedActors(ATTACHED_ARR, true)
+        local source = type(ret) == 'table' and ret or ATTACHED_ARR
+        if type(source) == 'table' then
+            for _, act in ipairs(source) do
+                addUniqueActor(list, seen, act)
+            end
+        elseif source and source.ForEach then
+            source:ForEach(function(_, elem)
+                local obj = elem and (elem.get and elem:get() or elem)
+                addUniqueActor(list, seen, obj)
+            end)
+        end
+        clearTable(ATTACHED_ARR)
+    end)
+end
+
+local function ensureCollisionIgnoreList(char, charKey)
+    local weap, rangedWeap = getEquippedWeapons(char)
+    local weapKey = (getObjectKey(weap) or '') .. '|' .. (getObjectKey(rangedWeap) or '')
+    if COL_IGNORE and COL_IGNORE_KEY == charKey and COL_IGNORE_WEAP_KEY == weapKey then
+        return
+    end
+    local list = {}
+    local seen = {}
+    addUniqueActor(list, seen, char)
+    addUniqueActor(list, seen, weap)
+    addUniqueActor(list, seen, rangedWeap)
+    collectAttachedActors(char, list, seen)
+    COL_IGNORE = list
+    COL_IGNORE_KEY = charKey
+    COL_IGNORE_WEAP_KEY = weapKey
+end
+
+local function updateAimBlend(char)
+    local target = isCharacterInRangedAim(char) and 1.0 or 0.0
+    local now = os.clock()
+    if aimClock == nil then
+        aimBlend = target
+        aimClock = now
+        return aimBlend
+    end
+    local dt = now - aimClock
+    aimClock = now
+    if dt < 0 then dt = 0 end
+    if dt > 0.25 then dt = 0.25 end
+    local alpha = 1.0 - math.exp(-dt / FPP_AIM_BLEND_TAU)
+    aimBlend = aimBlend + (target - aimBlend) * alpha
+    if aimBlend < 0.001 and target == 0.0 then
+        aimBlend = 0.0
+    elseif aimBlend > 0.999 and target == 1.0 then
+        aimBlend = 1.0
+    end
+    return aimBlend
+end
+
+local function enforceSpringArmFppFrame(springArm)
+    pcall(function()
+        springArm.bUsePawnControlRotation = false
+        springArm.bDoCollisionTest = false
+        springArm.bEnableCameraLag = false
+        springArm.bEnableCameraRotationLag = false
+        springArm.TargetArmLength = 0.0
+        pcall(function() springArm.ArmLengthMin = 0.0 end)
+        springArm.SocketOffset = ZERO_VEC
+    end)
+end
+
 local function computeClampedHeadBase(char, mesh)
     local loc = char:K2_GetActorLocation()
     local head = mesh:GetSocketLocation(FName(HEAD_BONE_NAME))
@@ -1060,6 +1306,11 @@ local function computeClampedHeadBase(char, mesh)
         local scale = FPP_MAX_HEAD_LATERAL / horiz
         rawDx = rawDx * scale
         rawDy = rawDy * scale
+    end
+    if rawDz < FPP_MIN_HEAD_Z then
+        rawDz = FPP_MIN_HEAD_Z
+    elseif rawDz > FPP_MAX_HEAD_Z then
+        rawDz = FPP_MAX_HEAD_Z
     end
     local now = os.clock()
     local teleported = false
@@ -1089,7 +1340,23 @@ end
 local function updateCameraPositionAndCollision(char, mesh, springArm)
     local ok, err = pcall(function()
         local lx, ly, bx, by, bz = computeClampedHeadBase(char, mesh)
-        local cx, cy, cz = bx, by, bz
+        local blend = updateAimBlend(char)
+        local pr = math.rad(ROT_TBL.Pitch)
+        local yr = math.rad(ROT_TBL.Yaw)
+        local cp, sp = math.cos(pr), math.sin(pr)
+        local cy, sy = math.cos(yr), math.sin(yr)
+        local fx, fy, fz = cp * cy, cp * sy, sp
+        local rx, ry, rz = -sy, cy, 0.0
+        local ux, uy, uz = -sp * cy, -sp * sy, cp
+
+        local desX, desY, desZ = bx, by, bz
+        if blend > 0.001 then
+            desX = bx + (fx * FPP_AIM_FWD + rx * FPP_AIM_RIGHT + ux * FPP_AIM_UP) * blend
+            desY = by + (fy * FPP_AIM_FWD + ry * FPP_AIM_RIGHT + uy * FPP_AIM_UP) * blend
+            desZ = bz + (fz * FPP_AIM_FWD + rz * FPP_AIM_RIGHT + uz * FPP_AIM_UP) * blend
+        end
+
+        local cx, cyPos, cz = desX, desY, desZ
         if not collisionDisabled then
             if not ksl then
                 ksl = StaticFindObject('/Script/Engine.Default__KismetSystemLibrary')
@@ -1099,65 +1366,71 @@ local function updateCameraPositionAndCollision(char, mesh, springArm)
                 Logger.warn('FPP collision: KismetSystemLibrary not found; disabled')
             else
                 local charKey = getObjectKey(char)
-                if not COL_IGNORE or COL_IGNORE_KEY ~= charKey then
-                    COL_IGNORE = { char }
-                    COL_IGNORE_KEY = charKey
-                end
-                local pr = math.rad(ROT_TBL.Pitch)
-                local yr = math.rad(ROT_TBL.Yaw)
-                local fx = math.cos(pr) * math.cos(yr)
-                local fy = math.cos(pr) * math.sin(yr)
-                local fz = math.sin(pr)
+                ensureCollisionIgnoreList(char, charKey)
                 COL_START.X, COL_START.Y, COL_START.Z = lx, ly, bz
-                COL_END.X = bx + fx * FPP_EYE_PROBE
-                COL_END.Y = by + fy * FPP_EYE_PROBE
-                COL_END.Z = bz + fz * FPP_EYE_PROBE
+                COL_END.X = desX + fx * FPP_EYE_PROBE
+                COL_END.Y = desY + fy * FPP_EYE_PROBE
+                COL_END.Z = desZ + fz * FPP_EYE_PROBE
+                clearTable(COL_HIT)
                 local okTrace, hit = pcall(function()
                     return ksl:SphereTraceSingle(char, COL_START, COL_END, FPP_SPHERE_RADIUS, 1, false, COL_IGNORE, 0, COL_HIT, true, COL_COLOR, COL_COLOR, 0.0)
                 end)
                 if not okTrace then
+                    clearTable(COL_HIT)
                     hit = ksl:LineTraceSingle(char, COL_START, COL_END, 1, false, COL_IGNORE, 0, COL_HIT, true, COL_COLOR, COL_COLOR, 0.0)
                 end
                 if hit == true then
-                    local ux = COL_END.X - COL_START.X
-                    local uy = COL_END.Y - COL_START.Y
-                    local uz = COL_END.Z - COL_START.Z
-                    local total = math.sqrt(ux * ux + uy * uy + uz * uz)
+                    local vx = COL_END.X - COL_START.X
+                    local vy = COL_END.Y - COL_START.Y
+                    local vz = COL_END.Z - COL_START.Z
+                    local total = math.sqrt(vx * vx + vy * vy + vz * vz)
                     local d = readTraceDistance(total)
+                    clearTable(COL_HIT)
                     if d == nil then
                         collisionDisabled = true
                         Logger.warn('FPP collision: cannot read hit distance; disabled')
                     elseif total > 0.001 then
-                        local nx, ny, nz = ux / total, uy / total, uz / total
-                        local baseAlong = (bx - lx) * nx + (by - ly) * ny
-                        local safeLimit = baseAlong + FPP_WALL_BUFFER
+                        local nx, ny, nz = vx / total, vy / total, vz / total
+                        local desiredAlong = (desX - lx) * nx + (desY - ly) * ny + (desZ - bz) * nz
+                        local safeLimit = desiredAlong + FPP_WALL_BUFFER
                         if d < safeLimit then
                             local excess = safeLimit - d
-                            if excess > FPP_MAX_COL_PULLBACK then
-                                excess = FPP_MAX_COL_PULLBACK
+                            local maxPullback = FPP_MAX_COL_PULLBACK + FPP_AIM_FWD * blend
+                            local axisCap = math.max(0.0, desiredAlong)
+                            if excess > maxPullback then
+                                excess = maxPullback
                             end
-                            cx = bx - nx * excess
-                            cy = by - ny * excess
-                            cz = bz - nz * excess
+                            if excess > axisCap then
+                                excess = axisCap
+                            end
+                            cx = desX - nx * excess
+                            cyPos = desY - ny * excess
+                            cz = desZ - nz * excess
                         end
                     end
+                else
+                    clearTable(COL_HIT)
                 end
             end
         end
         COL_TARGET.X = cx
-        COL_TARGET.Y = cy
+        COL_TARGET.Y = cyPos
         COL_TARGET.Z = cz
-        local cam = getCharacterCamera(char)
+        local cam = getCharacterCamera(char, springArm)
         local targetComp = isValidUObject(cam) and cam or springArm
         if targetComp == cam then
             cam:SetAbsolute(true, true, true)
         end
+        clearTable(EMPTY_HIT)
         if not pcall(function()
             targetComp:K2_SetWorldLocationAndRotation(COL_TARGET, ROT_TBL, false, EMPTY_HIT, true)
         end) then
+            clearTable(EMPTY_HIT)
             targetComp:K2_SetWorldLocation(COL_TARGET, false, EMPTY_HIT, true)
+            clearTable(EMPTY_HIT)
             targetComp:K2_SetWorldRotation(ROT_TBL, false, EMPTY_HIT, true)
         end
+        clearTable(EMPTY_HIT)
     end)
     if not ok then
         collisionDisabled = true
@@ -1167,7 +1440,7 @@ local function updateCameraPositionAndCollision(char, mesh, springArm)
     return true
 end
 
-local function applyRotationSyncOnGameThread()
+local function applyRotationSyncOnGameThread(fromApply)
     if not fppHeadEnabled or thirdPersonActive or (Hooks.isInCinematic and Hooks.isInCinematic()) then
         return
     end
@@ -1181,10 +1454,14 @@ local function applyRotationSyncOnGameThread()
         return
     end
 
+    local expectedParent = (isValidUObject(view) and not isSameUObject(view, mesh)) and view or origParent
     local okParent, curParent = pcall(function()
         return springArm:GetAttachParent()
     end)
-    if not okParent or not isSameUObject(curParent, mesh) then
+    if not okParent or (isValidUObject(expectedParent) and not isSameUObject(curParent, expectedParent)) then
+        if not fromApply and applyFPPHeadTrackingOnGameThread then
+            applyFPPHeadTrackingOnGameThread()
+        end
         return
     end
 
@@ -1192,14 +1469,7 @@ local function applyRotationSyncOnGameThread()
         return
     end
 
-    pcall(function()
-        local armLen = springArm.TargetArmLength
-        if type(armLen) == 'number' and math.abs(armLen) > 0.01 then
-            springArm.TargetArmLength = 0.0
-            springArm.SocketOffset = ZERO_VEC
-        end
-    end)
-
+    enforceSpringArmFppFrame(springArm)
     setSpringTickEnabled(springArm, true)
     stopCombatCameraAnimations()
     smoothRotationTbl()
@@ -1208,7 +1478,9 @@ local function applyRotationSyncOnGameThread()
     local armAddr = getObjectKey(springArm)
     if not okPos then
         local okRot = pcall(function()
+            clearTable(EMPTY_HIT)
             springArm:K2_SetWorldRotation(ROT_TBL, false, EMPTY_HIT, true)
+            clearTable(EMPTY_HIT)
         end)
         if okRot then
             lastSyncArmAddr = armAddr
@@ -1284,10 +1556,14 @@ local function restoreFPPHeadTrackingOnGameThread()
     end
 
     pcall(function()
+        clearTable(EMPTY_HIT)
         springArm:K2_SetRelativeLocation(ZERO_VEC, false, EMPTY_HIT, true)
+        clearTable(EMPTY_HIT)
     end)
     pcall(function()
+        clearTable(EMPTY_HIT)
         springArm:K2_SetRelativeRotation(ZERO_ROT, false, EMPTY_HIT, true)
+        clearTable(EMPTY_HIT)
     end)
 
     pcall(function()
@@ -1297,7 +1573,7 @@ local function restoreFPPHeadTrackingOnGameThread()
     resetLastSyncRotation()
 end
 
-local function applyFPPHeadTrackingOnGameThread()
+applyFPPHeadTrackingOnGameThread = function()
     if not fppHeadEnabled then
         return
     end
@@ -1357,22 +1633,19 @@ local function applyFPPHeadTrackingOnGameThread()
     if isValidUObject(expectedArmParent) and not isSameUObject(curArmParent, expectedArmParent) then
         pcall(function()
             springArm:K2_AttachToComponent(expectedArmParent, FName(NONE_NAME), 0, 0, 0, false)
+            clearTable(EMPTY_HIT)
             springArm:K2_SetRelativeLocation(ZERO_VEC, false, EMPTY_HIT, true)
+            clearTable(EMPTY_HIT)
             springArm:K2_SetRelativeRotation(ZERO_ROT, false, EMPTY_HIT, true)
+            clearTable(EMPTY_HIT)
         end)
     end
 
     pcall(function()
         springArm:SetAbsolute(false, false, false)
-        springArm.bUsePawnControlRotation = false
-        springArm.bDoCollisionTest = false
         springArm.ProbeSize = 12.0
-        pcall(function() springArm.ArmLengthMin = 0.0 end)
-        springArm.bEnableCameraLag = false
-        springArm.bEnableCameraRotationLag = false
-        springArm.TargetArmLength = 0.0
-        springArm.SocketOffset = ZERO_VEC
     end)
+    enforceSpringArmFppFrame(springArm)
     setSpringTickEnabled(springArm, true)
     attachCameraForFPP(char, springArm)
     stopCombatCameraAnimations()
@@ -1383,7 +1656,7 @@ local function applyFPPHeadTrackingOnGameThread()
 
     resetSmoothing()
     resetLastSyncRotation()
-    applyRotationSyncOnGameThread()
+    applyRotationSyncOnGameThread(true)
 end
 
 local function applyFPPHeadTracking()
@@ -1444,7 +1717,7 @@ local function maintainFPPHeadTrackingOnGameThread()
     end
 
     if not needsReapply then
-        local cam = getCharacterCamera(char)
+        local cam = getCharacterCamera(char, springArm)
         if isValidUObject(cam) then
             local okCam, camParent, camSock = pcall(function()
                 return cam:GetAttachParent(), cam:GetAttachSocketName()
@@ -1458,10 +1731,10 @@ local function maintainFPPHeadTrackingOnGameThread()
                 end
             end
             if not needsReapply then
-                local okCamAbs, camAbsLoc, camAbsRot, camAbsScale = pcall(function()
-                    return cam.bAbsoluteLocation, cam.bAbsoluteRotation, cam.bAbsoluteScale
+                local okCamAbsRot, camAbsRot = pcall(function()
+                    return cam.bAbsoluteRotation
                 end)
-                if okCamAbs and (camAbsLoc ~= true or camAbsRot ~= true or camAbsScale ~= true) then
+                if not okCamAbsRot or camAbsRot ~= true then
                     needsReapply = true
                 end
             end
@@ -1469,15 +1742,14 @@ local function maintainFPPHeadTrackingOnGameThread()
     end
 
     if not needsReapply then
-        local okFlags, absLoc, absRot, usePawnCtrl, doCol, camLag, rotLag = pcall(function()
-            return springArm.bAbsoluteLocation,
-                springArm.bAbsoluteRotation,
+        local okFlags, absRot, usePawnCtrl, doCol, camLag, rotLag = pcall(function()
+            return springArm.bAbsoluteRotation,
                 springArm.bUsePawnControlRotation,
                 springArm.bDoCollisionTest,
                 springArm.bEnableCameraLag,
                 springArm.bEnableCameraRotationLag
         end)
-        if okFlags and (absLoc == true or absRot == true or usePawnCtrl == true or doCol == true or camLag == true or rotLag == true) then
+        if okFlags and (absRot == true or usePawnCtrl == true or doCol == true or camLag == true or rotLag == true) then
             needsReapply = true
         end
     end
