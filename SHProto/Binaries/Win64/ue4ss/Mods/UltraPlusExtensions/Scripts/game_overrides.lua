@@ -459,6 +459,7 @@ local origParent = nil
 local origDoCollisionTest = nil
 local origCameraLag = nil
 local origCameraRotLag = nil
+local origTargetArmLength = nil
 local origSocketOffset = nil
 local thirdPersonActive = false
 local lastSyncArmAddr = nil
@@ -487,6 +488,7 @@ local function clearSpringArmBackup()
     origDoCollisionTest = nil
     origCameraLag = nil
     origCameraRotLag = nil
+    origTargetArmLength = nil
     origSocketOffset = nil
 end
 
@@ -563,6 +565,7 @@ local function backupSpringArmSettings(springArm)
         origDoCollisionTest = springArm.bDoCollisionTest
         origCameraLag = springArm.bEnableCameraLag
         origCameraRotLag = springArm.bEnableCameraRotationLag
+        origTargetArmLength = springArm.TargetArmLength
         local sock = springArm.SocketOffset
         if sock then
             origSocketOffset = {
@@ -727,43 +730,6 @@ local function isThirdPersonOrCutscene(char, mesh, springArm, pc)
         if okVT and isValidUObject(vt) and not isSameUObject(vt, char) then
             return true
         end
-
-        local okCamLoc, camLoc = pcall(function()
-            local pcm = pc.PlayerCameraManager
-            if isValidUObject(pcm) then
-                return pcm:GetCameraLocation()
-            end
-            return nil
-        end)
-        local okHeadLoc, headLoc = pcall(function()
-            return mesh:GetSocketLocation(FName(HEAD_BONE_NAME))
-        end)
-        if okCamLoc and camLoc and okHeadLoc and headLoc then
-            local okDist, dx, dy, dz = pcall(function()
-                return camLoc.X - headLoc.X, camLoc.Y - headLoc.Y, camLoc.Z - headLoc.Z
-            end)
-            if okDist and dx and dy and dz then
-                local distSq = dx * dx + dy * dy + dz * dz
-                if thirdPersonActive then
-                    if distSq > 1600.0 then -- 40 cm hysteresis exit
-                        return true
-                    end
-                elseif distSq > 3600.0 then -- 60 cm enter
-                    return true
-                end
-            end
-        end
-    end
-
-    local okArmLen, armLen = pcall(function()
-        return springArm.TargetArmLength
-    end)
-    if okArmLen and type(armLen) == 'number' then
-        if thirdPersonActive then
-            if armLen > 20.0 then return true end
-        elseif armLen > 25.0 then
-            return true
-        end
     end
 
     return false
@@ -853,6 +819,14 @@ local function applyRotationSyncOnGameThread()
         return
     end
 
+    pcall(function()
+        local armLen = springArm.TargetArmLength
+        if type(armLen) == 'number' and math.abs(armLen) > 0.01 then
+            springArm.TargetArmLength = 0.0
+            springArm.SocketOffset = ZERO_VEC
+        end
+    end)
+
     local armAddr = getObjectKey(springArm)
     rotSyncTickCounter = rotSyncTickCounter + 1
     if armAddr and armAddr == lastSyncArmAddr and lastSyncPitch ~= nil and lastSyncYaw ~= nil and lastSyncRoll ~= nil then
@@ -921,6 +895,7 @@ local function applyFPPHeadTrackingOnGameThread()
         springArm.bDoCollisionTest = false
         springArm.bEnableCameraLag = false
         springArm.bEnableCameraRotationLag = false
+        springArm.TargetArmLength = 0.0
         springArm.SocketOffset = ZERO_VEC
     end)
     pcall(function()
@@ -965,6 +940,9 @@ local function restoreFPPHeadTrackingOnGameThread()
             end
             if origCameraRotLag ~= nil then
                 springArm.bEnableCameraRotationLag = origCameraRotLag
+            end
+            if origTargetArmLength ~= nil then
+                springArm.TargetArmLength = origTargetArmLength
             end
             if origSocketOffset ~= nil then
                 springArm.SocketOffset = origSocketOffset
