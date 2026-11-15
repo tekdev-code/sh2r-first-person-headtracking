@@ -897,17 +897,15 @@ local function attachCameraForFPP(char, springArm)
             origCamAbsScale = (absScale == true)
         end
     end
-    if okAbs and (absLoc == true or absRot == true or absScale == true) then
+    if okAbs and (absLoc ~= true or absRot ~= true or absScale ~= true) then
         pcall(function()
-            cam:SetAbsolute(false, false, false)
+            cam:SetAbsolute(true, true, true)
         end)
     end
     if not isSameUObject(curParent, springArm) or curSockStr ~= NONE_NAME then
         pcall(function()
-            cam:SetAbsolute(false, false, false)
             cam:K2_AttachToComponent(springArm, FName(NONE_NAME), 2, 2, 1, false)
-            cam:K2_SetRelativeLocation(ZERO_VEC, false, EMPTY_HIT, true)
-            cam:K2_SetRelativeRotation(ZERO_ROT, false, EMPTY_HIT, true)
+            cam:SetAbsolute(true, true, true)
         end)
     end
 end
@@ -1149,11 +1147,16 @@ local function updateCameraPositionAndCollision(char, mesh, springArm)
         COL_TARGET.X = cx
         COL_TARGET.Y = cy
         COL_TARGET.Z = cz
+        local cam = getCharacterCamera(char)
+        local targetComp = isValidUObject(cam) and cam or springArm
+        if targetComp == cam then
+            cam:SetAbsolute(true, true, true)
+        end
         if not pcall(function()
-            springArm:K2_SetWorldLocationAndRotation(COL_TARGET, ROT_TBL, false, EMPTY_HIT, true)
+            targetComp:K2_SetWorldLocationAndRotation(COL_TARGET, ROT_TBL, false, EMPTY_HIT, true)
         end) then
-            springArm:K2_SetWorldLocation(COL_TARGET, false, EMPTY_HIT, true)
-            springArm:K2_SetWorldRotation(ROT_TBL, false, EMPTY_HIT, true)
+            targetComp:K2_SetWorldLocation(COL_TARGET, false, EMPTY_HIT, true)
+            targetComp:K2_SetWorldRotation(ROT_TBL, false, EMPTY_HIT, true)
         end
     end)
     if not ok then
@@ -1197,7 +1200,7 @@ local function applyRotationSyncOnGameThread()
         end
     end)
 
-    setSpringTickEnabled(springArm, false)
+    setSpringTickEnabled(springArm, true)
     stopCombatCameraAnimations()
     smoothRotationTbl()
     local okPos = updateCameraPositionAndCollision(char, mesh, springArm)
@@ -1334,25 +1337,35 @@ local function applyFPPHeadTrackingOnGameThread()
         curArmParent = springArm:GetAttachParent()
     end)
 
-    if not isSameUObject(curArmParent, mesh) then
-        if not isValidUObject(origParent) or isSameUObject(origParent, mesh) then
-            if isValidUObject(curArmParent) and not isSameUObject(curArmParent, mesh) then
-                origParent = curArmParent
-            else
-                origParent = view
-            end
-        end
+    local expectedArmParent = nil
+    if isValidUObject(view) and not isSameUObject(view, mesh) then
+        expectedArmParent = view
+    elseif isValidUObject(origParent) and not isSameUObject(origParent, mesh) then
+        expectedArmParent = origParent
+    else
+        expectedArmParent = getFallbackRootParent(char)
+    end
 
+    if not isValidUObject(origParent) or isSameUObject(origParent, mesh) then
+        if isValidUObject(curArmParent) and not isSameUObject(curArmParent, mesh) then
+            origParent = curArmParent
+        elseif isValidUObject(expectedArmParent) then
+            origParent = expectedArmParent
+        end
+    end
+
+    if isValidUObject(expectedArmParent) and not isSameUObject(curArmParent, expectedArmParent) then
         pcall(function()
-            springArm:K2_AttachToComponent(mesh, FName(HEAD_BONE_NAME), 2, 1, 1, false)
+            springArm:K2_AttachToComponent(expectedArmParent, FName(NONE_NAME), 0, 0, 0, false)
             springArm:K2_SetRelativeLocation(ZERO_VEC, false, EMPTY_HIT, true)
+            springArm:K2_SetRelativeRotation(ZERO_ROT, false, EMPTY_HIT, true)
         end)
     end
 
     pcall(function()
-        springArm:SetAbsolute(true, true, true)
+        springArm:SetAbsolute(false, false, false)
         springArm.bUsePawnControlRotation = false
-        springArm.bDoCollisionTest = true
+        springArm.bDoCollisionTest = false
         springArm.ProbeSize = 12.0
         pcall(function() springArm.ArmLengthMin = 0.0 end)
         springArm.bEnableCameraLag = false
@@ -1360,7 +1373,7 @@ local function applyFPPHeadTrackingOnGameThread()
         springArm.TargetArmLength = 0.0
         springArm.SocketOffset = ZERO_VEC
     end)
-    setSpringTickEnabled(springArm, false)
+    setSpringTickEnabled(springArm, true)
     attachCameraForFPP(char, springArm)
     stopCombatCameraAnimations()
     pcall(function()
@@ -1421,10 +1434,11 @@ local function maintainFPPHeadTrackingOnGameThread()
     end
 
     if not needsReapply then
+        local expectedArmParent = (isValidUObject(view) and not isSameUObject(view, mesh)) and view or origParent
         local okParent, curArmParent = pcall(function()
             return springArm:GetAttachParent()
         end)
-        if okParent and not isSameUObject(curArmParent, mesh) then
+        if okParent and isValidUObject(expectedArmParent) and not isSameUObject(curArmParent, expectedArmParent) then
             needsReapply = true
         end
     end
@@ -1447,7 +1461,7 @@ local function maintainFPPHeadTrackingOnGameThread()
                 local okCamAbs, camAbsLoc, camAbsRot, camAbsScale = pcall(function()
                     return cam.bAbsoluteLocation, cam.bAbsoluteRotation, cam.bAbsoluteScale
                 end)
-                if okCamAbs and (camAbsLoc == true or camAbsRot == true or camAbsScale == true) then
+                if okCamAbs and (camAbsLoc ~= true or camAbsRot ~= true or camAbsScale ~= true) then
                     needsReapply = true
                 end
             end
@@ -1463,7 +1477,7 @@ local function maintainFPPHeadTrackingOnGameThread()
                 springArm.bEnableCameraLag,
                 springArm.bEnableCameraRotationLag
         end)
-        if okFlags and (absLoc == false or absRot == false or usePawnCtrl == true or doCol == false or camLag == true or rotLag == true) then
+        if okFlags and (absLoc == true or absRot == true or usePawnCtrl == true or doCol == true or camLag == true or rotLag == true) then
             needsReapply = true
         end
     end
@@ -1471,7 +1485,7 @@ local function maintainFPPHeadTrackingOnGameThread()
     if needsReapply then
         applyFPPHeadTrackingOnGameThread()
     else
-        setSpringTickEnabled(springArm, false)
+        setSpringTickEnabled(springArm, true)
     end
 end
 
