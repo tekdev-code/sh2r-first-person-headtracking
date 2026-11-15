@@ -454,12 +454,18 @@ local trackedChar = nil
 local trackedMesh = nil
 local trackedSpringArm = nil
 local trackedView = nil
+local trackedPC = nil
 local origParent = nil
+local thirdPersonActive = false
+local rotSyncInFlight = false
 local maintenanceInFlight = false
 
 local HEAD_BONE_NAME = 'head_bn'
+local NONE_NAME = 'None'
 local ZERO_VEC = {X = 0.0, Y = 0.0, Z = 0.0}
 local DEFAULT_VIEW_LOC = {X = 0.0, Y = 0.0, Z = 60.0}
+local ZERO_ROT = {Pitch = 0.0, Yaw = 0.0, Roll = 0.0}
+local ROT_TBL = {Pitch = 0.0, Yaw = 0.0, Roll = 0.0}
 local EMPTY_HIT = {}
 
 local function isValidUObject(obj)
@@ -516,6 +522,25 @@ local function clearTrackedCache()
     trackedMesh = nil
     trackedSpringArm = nil
     trackedView = nil
+    trackedPC = nil
+end
+
+local function getActivePlayerController(char)
+    local pc = nil
+    if isValidUObject(char) then
+        pcall(function()
+            if isNonDefaultUObject(char.Controller) then
+                pc = char.Controller
+            end
+        end)
+    end
+    if not isValidUObject(pc) and FindFirstOf then
+        local okPC, foundPC = pcall(FindFirstOf, 'PlayerController')
+        if okPC and isNonDefaultUObject(foundPC) then
+            pc = foundPC
+        end
+    end
+    return pc
 end
 
 local function extractCharacterComponents(candidate)
@@ -586,12 +611,14 @@ local function syncTrackedCharacter(char, mesh, springArm, view)
     if charKey and charKey ~= trackedCharAddr then
         trackedCharAddr = charKey
         origParent = nil
+        thirdPersonActive = false
     end
 
     trackedChar = char
     trackedMesh = mesh
     trackedSpringArm = springArm
     trackedView = view
+    trackedPC = getActivePlayerController(char)
 end
 
 local function setDLCSkinHidden(char, hidden)
@@ -616,25 +643,156 @@ local function getFallbackRootParent(char)
     return fallback
 end
 
-local function ensureSpringArmUnderView(springArm, view)
-    local okParent, armParent = pcall(function()
-        return springArm:GetAttachParent()
+local function ensureViewUnderRoot(char, view, mesh)
+    if not isValidUObject(view) then return end
+    local okParent, curViewParent = pcall(function()
+        return view:GetAttachParent()
     end)
-    if okParent and isValidUObject(view) and not isSameUObject(armParent, view) then
+    if okParent and isSameUObject(curViewParent, mesh) then
+        local rootParent = getFallbackRootParent(char)
         pcall(function()
-            springArm:SetAbsolute(false, false, false)
+            view:SetAbsolute(false, false, false)
         end)
+        if isValidUObject(rootParent) then
+            pcall(function()
+                view:K2_AttachToComponent(rootParent, FName(NONE_NAME), 0, 0, 0, false)
+            end)
+        end
         pcall(function()
-            springArm:K2_AttachToComponent(view, FName('None'), 0, 0, 0, false)
-        end)
-        pcall(function()
-            springArm:K2_SetRelativeLocation(ZERO_VEC, false, EMPTY_HIT, true)
+            view:K2_SetRelativeLocation(DEFAULT_VIEW_LOC, false, EMPTY_HIT, true)
         end)
     end
 end
 
+local function isThirdPersonOrCutscene(char, mesh, springArm, pc)
+    if Hooks.isInCinematic and Hooks.isInCinematic() then
+        return true
+    end
+
+    if isValidUObject(pc) then
+        local okVT, vt = pcall(function()
+            return pc:GetViewTarget()
+        end)
+        if okVT and isValidUObject(vt) and not isSameUObject(vt, char) then
+            return true
+        end
+
+        local okCamLoc, camLoc = pcall(function()
+            local pcm = pc.PlayerCameraManager
+            if isValidUObject(pcm) then
+                return pcm:GetCameraLocation()
+            end
+            return nil
+        end)
+        local okHeadLoc, headLoc = pcall(function()
+            return mesh:GetSocketLocation(FName(HEAD_BONE_NAME))
+        end)
+        if okCamLoc and camLoc and okHeadLoc and headLoc then
+            local okDist, dx, dy, dz = pcall(function()
+                return camLoc.X - headLoc.X, camLoc.Y - headLoc.Y, camLoc.Z - headLoc.Z
+            end)
+            if okDist and dx and dy and dz then
+                local distSq = dx * dx + dy * dy + dz * dz
+                if thirdPersonActive then
+                    if distSq > 1600.0 then -- 40 cm hysteresis exit
+                        return true
+                    end
+                elseif distSq > 3600.0 then -- 60 cm enter
+                    return true
+                end
+            end
+        end
+    end
+
+    local okArmLen, armLen = pcall(function()
+        return springArm.TargetArmLength
+    end)
+    if okArmLen and type(armLen) == 'number' then
+        if thirdPersonActive then
+            if armLen > 20.0 then return true end
+        elseif armLen > 25.0 then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function readViewRotationIntoTbl(view)
+    if not isValidUObject(view) then
+        return false
+    end
+
+    local ok, rot = pcall(function()
+        return view:GetViewRotation()
+    end)
+    local okPYR, p, y, r = false, nil, nil, nil
+    if ok and rot then
+        okPYR, p, y, r = pcall(function()
+            return rot.Pitch, rot.Yaw, rot.Roll
+        end)
+    end
+
+    if not okPYR or p == nil or y == nil or r == nil or math.abs(p) < 0.0001 then
+        local okComp, compRot = pcall(function()
+            return view:K2_GetComponentRotation()
+        end)
+        if okComp and compRot then
+            local okC, cp, cy, cr = pcall(function()
+                return compRot.Pitch, compRot.Yaw, compRot.Roll
+            end)
+            if okC and cp ~= nil and cy ~= nil and cr ~= nil then
+                if not okPYR or p == nil or y == nil or r == nil then
+                    p, y, r = cp, cy, cr
+                    okPYR = true
+                elseif math.abs(cp) >= 0.0001 then
+                    p = cp
+                end
+            end
+        end
+    end
+
+    if okPYR and p ~= nil and y ~= nil and r ~= nil then
+        ROT_TBL.Pitch = p
+        ROT_TBL.Yaw = y
+        ROT_TBL.Roll = r
+        return true
+    end
+    return false
+end
+
+local function applyRotationSyncOnGameThread()
+    if not fppHeadEnabled or thirdPersonActive or (Hooks.isInCinematic and Hooks.isInCinematic()) then
+        return
+    end
+
+    local char = trackedChar
+    local mesh = trackedMesh
+    local springArm = trackedSpringArm
+    local view = trackedView
+    if not isValidUObject(char) or not isValidUObject(mesh) or not isValidUObject(springArm) or not isValidUObject(view) then
+        clearTrackedCache()
+        return
+    end
+
+    local okParent, curParent = pcall(function()
+        return springArm:GetAttachParent()
+    end)
+    if not okParent or not isSameUObject(curParent, mesh) then
+        return
+    end
+
+    if not readViewRotationIntoTbl(view) then
+        return
+    end
+
+    pcall(function()
+        springArm:K2_SetWorldRotation(ROT_TBL, false, EMPTY_HIT, true)
+    end)
+end
+
 local function applyFPPHeadTrackingOnGameThread()
-    if not fppHeadEnabled or (Hooks.isInCinematic and Hooks.isInCinematic()) then
+    if not fppHeadEnabled then
         return
     end
 
@@ -642,38 +800,48 @@ local function applyFPPHeadTrackingOnGameThread()
     if not char then return end
 
     syncTrackedCharacter(char, mesh, springArm, view)
-    ensureSpringArmUnderView(springArm, view)
+    ensureViewUnderRoot(char, view, mesh)
 
-    local curViewParent = nil
+    if isThirdPersonOrCutscene(char, mesh, springArm, trackedPC) then
+        thirdPersonActive = true
+        return
+    end
+    thirdPersonActive = false
+
+    local curArmParent = nil
     pcall(function()
-        curViewParent = view:GetAttachParent()
+        curArmParent = springArm:GetAttachParent()
     end)
 
-    -- Attach char.View to head_bn while keeping rotation/scale absolute so View handles Pitch & Yaw in C++
-    if not isSameUObject(curViewParent, mesh) then
-        if not isValidUObject(origParent) then
-            if isValidUObject(curViewParent) and not isSameUObject(curViewParent, mesh) then
-                origParent = curViewParent
+    if not isSameUObject(curArmParent, mesh) then
+        if not isValidUObject(origParent) or isSameUObject(origParent, mesh) then
+            if isValidUObject(curArmParent) and not isSameUObject(curArmParent, mesh) then
+                origParent = curArmParent
             else
-                origParent = getFallbackRootParent(char)
+                origParent = view
             end
         end
 
         pcall(function()
-            view:K2_AttachToComponent(mesh, FName(HEAD_BONE_NAME), 2, 0, 0, false)
+            springArm:K2_AttachToComponent(mesh, FName(HEAD_BONE_NAME), 2, 1, 1, false)
         end)
     end
 
     pcall(function()
-        view:SetAbsolute(false, true, true)
+        springArm:SetAbsolute(false, true, true)
     end)
     pcall(function()
-        view:K2_SetRelativeLocation(ZERO_VEC, false, EMPTY_HIT, true)
+        springArm.bUsePawnControlRotation = false
+    end)
+    pcall(function()
+        springArm:K2_SetRelativeLocation(ZERO_VEC, false, EMPTY_HIT, true)
     end)
     pcall(function()
         mesh:HideBoneByName(FName(HEAD_BONE_NAME), 0)
     end)
     setDLCSkinHidden(char, true)
+
+    applyRotationSyncOnGameThread()
 end
 
 local function applyFPPHeadTracking()
@@ -681,41 +849,6 @@ local function applyFPPHeadTracking()
         return
     end
     SafeExec.executeInGameThread(applyFPPHeadTrackingOnGameThread)
-end
-
-local function maintainFPPHeadTrackingOnGameThread()
-    if not fppHeadEnabled or (Hooks.isInCinematic and Hooks.isInCinematic()) then
-        return
-    end
-
-    local char, mesh, springArm, view = getActiveCharacterComponents()
-    if not char then
-        clearTrackedCache()
-        return
-    end
-
-    syncTrackedCharacter(char, mesh, springArm, view)
-
-    local needsReapply = false
-    local okHidden, isHidden = pcall(function()
-        return mesh:IsBoneHiddenByName(FName(HEAD_BONE_NAME))
-    end)
-    if okHidden and not isHidden then
-        needsReapply = true
-    end
-
-    if not needsReapply then
-        local okParent, curViewParent = pcall(function()
-            return view:GetAttachParent()
-        end)
-        if okParent and not isSameUObject(curViewParent, mesh) then
-            needsReapply = true
-        end
-    end
-
-    if needsReapply then
-        applyFPPHeadTrackingOnGameThread()
-    end
 end
 
 local function restoreFPPHeadTrackingOnGameThread()
@@ -729,14 +862,19 @@ local function restoreFPPHeadTrackingOnGameThread()
     end
 
     syncTrackedCharacter(char, mesh, springArm, view)
-    ensureSpringArmUnderView(springArm, view)
+    ensureViewUnderRoot(char, view, mesh)
 
     pcall(function()
-        view:SetAbsolute(false, false, false)
+        springArm.bUsePawnControlRotation = false
+    end)
+    pcall(function()
+        springArm:SetAbsolute(false, false, false)
     end)
 
     local targetParent = nil
-    if isValidUObject(origParent) and not isSameUObject(origParent, mesh) then
+    if isValidUObject(view) and not isSameUObject(view, mesh) then
+        targetParent = view
+    elseif isValidUObject(origParent) and not isSameUObject(origParent, mesh) then
         targetParent = origParent
     else
         targetParent = getFallbackRootParent(char)
@@ -744,18 +882,84 @@ local function restoreFPPHeadTrackingOnGameThread()
 
     if isValidUObject(targetParent) then
         pcall(function()
-            view:K2_AttachToComponent(targetParent, FName('None'), 0, 0, 0, false)
+            springArm:K2_AttachToComponent(targetParent, FName(NONE_NAME), 0, 0, 0, false)
         end)
     end
 
     pcall(function()
-        view:K2_SetRelativeLocation(DEFAULT_VIEW_LOC, false, EMPTY_HIT, true)
+        springArm:K2_SetRelativeLocation(ZERO_VEC, false, EMPTY_HIT, true)
+    end)
+    pcall(function()
+        springArm:K2_SetRelativeRotation(ZERO_ROT, false, EMPTY_HIT, true)
     end)
 
     pcall(function()
         mesh:UnHideBoneByName(FName(HEAD_BONE_NAME))
     end)
     setDLCSkinHidden(char, false)
+end
+
+local function maintainFPPHeadTrackingOnGameThread()
+    if not fppHeadEnabled then
+        return
+    end
+
+    local char, mesh, springArm, view = getActiveCharacterComponents()
+    if not char then
+        clearTrackedCache()
+        return
+    end
+
+    syncTrackedCharacter(char, mesh, springArm, view)
+
+    if isThirdPersonOrCutscene(char, mesh, springArm, trackedPC) then
+        if not thirdPersonActive then
+            thirdPersonActive = true
+            restoreFPPHeadTrackingOnGameThread()
+        else
+            pcall(function()
+                mesh:UnHideBoneByName(FName(HEAD_BONE_NAME))
+            end)
+            setDLCSkinHidden(char, false)
+        end
+        return
+    end
+
+    if thirdPersonActive then
+        thirdPersonActive = false
+        applyFPPHeadTrackingOnGameThread()
+        return
+    end
+
+    local needsReapply = false
+    local okHidden, isHidden = pcall(function()
+        return mesh:IsBoneHiddenByName(FName(HEAD_BONE_NAME))
+    end)
+    if okHidden and not isHidden then
+        needsReapply = true
+    end
+
+    if not needsReapply then
+        local okParent, curArmParent = pcall(function()
+            return springArm:GetAttachParent()
+        end)
+        if okParent and not isSameUObject(curArmParent, mesh) then
+            needsReapply = true
+        end
+    end
+
+    if not needsReapply then
+        local okFlags, absRot, usePawnCtrl = pcall(function()
+            return springArm.bAbsoluteRotation, springArm.bUsePawnControlRotation
+        end)
+        if okFlags and (absRot == false or usePawnCtrl == true) then
+            needsReapply = true
+        end
+    end
+
+    if needsReapply then
+        applyFPPHeadTrackingOnGameThread()
+    end
 end
 
 local function restoreFPPHeadTracking()
@@ -806,9 +1010,9 @@ table.insert(SilentHillOverrides.initFunctions, function(configPath, setCVar, se
 
     SafeExec.executeWithDelay(1500, applyFPPHeadTracking)
 
-    -- Slow discovery & maintenance loop (500 ms)
-    SafeExec.loopAsync(500, function()
-        if not fppHeadEnabled or (Hooks.isInCinematic and Hooks.isInCinematic()) then
+    -- Discovery, 3rd-person scene detection, and maintenance loop (150 ms)
+    SafeExec.loopAsync(150, function()
+        if not fppHeadEnabled then
             return false
         end
         if maintenanceInFlight then
@@ -825,6 +1029,29 @@ table.insert(SilentHillOverrides.initFunctions, function(configPath, setCVar, se
         end)
         if not scheduled then
             maintenanceInFlight = false
+        end
+        return false
+    end)
+
+    -- Fast View-to-SpringArm world rotation sync loop (8 ms, struct-property-free)
+    SafeExec.loopAsync(8, function()
+        if not fppHeadEnabled or thirdPersonActive or (Hooks.isInCinematic and Hooks.isInCinematic()) then
+            return false
+        end
+        if rotSyncInFlight or not trackedSpringArm then
+            return false
+        end
+
+        rotSyncInFlight = true
+        local scheduled = SafeExec.executeInGameThread(function()
+            local ok, err = pcall(applyRotationSyncOnGameThread)
+            rotSyncInFlight = false
+            if not ok then
+                Logger.debug('FPP rotation sync error: %s', tostring(err))
+            end
+        end)
+        if not scheduled then
+            rotSyncInFlight = false
         end
         return false
     end)
