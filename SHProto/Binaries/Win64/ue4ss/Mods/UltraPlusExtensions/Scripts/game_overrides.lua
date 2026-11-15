@@ -892,7 +892,9 @@ local function applyFPPHeadTrackingOnGameThread()
     pcall(function()
         springArm:SetAbsolute(false, true, true)
         springArm.bUsePawnControlRotation = false
-        springArm.bDoCollisionTest = false
+        springArm.bDoCollisionTest = true
+        springArm.ProbeSize = 12.0
+        pcall(function() springArm.ArmLengthMin = 0.0 end)
         springArm.bEnableCameraLag = false
         springArm.bEnableCameraRotationLag = false
         springArm.TargetArmLength = 0.0
@@ -1036,7 +1038,7 @@ local function maintainFPPHeadTrackingOnGameThread()
                 springArm.bEnableCameraLag,
                 springArm.bEnableCameraRotationLag
         end)
-        if okFlags and (absRot == false or usePawnCtrl == true or doCol == true or camLag == true or rotLag == true) then
+        if okFlags and (absRot == false or usePawnCtrl == true or doCol == false or camLag == true or rotLag == true) then
             needsReapply = true
         end
     end
