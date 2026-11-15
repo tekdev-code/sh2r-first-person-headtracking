@@ -456,9 +456,16 @@ local trackedSpringArm = nil
 local trackedView = nil
 local trackedPC = nil
 local origParent = nil
+local origDoCollisionTest = nil
+local origCameraLag = nil
+local origCameraRotLag = nil
+local origSocketOffset = nil
 local thirdPersonActive = false
-local rotSyncInFlight = false
-local maintenanceInFlight = false
+local lastSyncArmAddr = nil
+local lastSyncPitch = nil
+local lastSyncYaw = nil
+local lastSyncRoll = nil
+local rotSyncTickCounter = 0
 
 local HEAD_BONE_NAME = 'head_bn'
 local NONE_NAME = 'None'
@@ -467,6 +474,21 @@ local DEFAULT_VIEW_LOC = {X = 0.0, Y = 0.0, Z = 60.0}
 local ZERO_ROT = {Pitch = 0.0, Yaw = 0.0, Roll = 0.0}
 local ROT_TBL = {Pitch = 0.0, Yaw = 0.0, Roll = 0.0}
 local EMPTY_HIT = {}
+
+local function resetLastSyncRotation()
+    lastSyncArmAddr = nil
+    lastSyncPitch = nil
+    lastSyncYaw = nil
+    lastSyncRoll = nil
+    rotSyncTickCounter = 0
+end
+
+local function clearSpringArmBackup()
+    origDoCollisionTest = nil
+    origCameraLag = nil
+    origCameraRotLag = nil
+    origSocketOffset = nil
+end
 
 local function isValidUObject(obj)
     if not obj then return false end
@@ -523,6 +545,35 @@ local function clearTrackedCache()
     trackedSpringArm = nil
     trackedView = nil
     trackedPC = nil
+    resetLastSyncRotation()
+    clearSpringArmBackup()
+end
+
+local origSpringArmAddr = nil
+
+local function backupSpringArmSettings(springArm)
+    local armAddr = getObjectKey(springArm)
+    if not armAddr then return end
+    if origSpringArmAddr == armAddr and origDoCollisionTest ~= nil then
+        return
+    end
+    origSpringArmAddr = armAddr
+
+    pcall(function()
+        origDoCollisionTest = springArm.bDoCollisionTest
+        origCameraLag = springArm.bEnableCameraLag
+        origCameraRotLag = springArm.bEnableCameraRotationLag
+        local sock = springArm.SocketOffset
+        if sock then
+            origSocketOffset = {
+                X = sock.X or 0.0,
+                Y = sock.Y or 0.0,
+                Z = sock.Z or 0.0
+            }
+        else
+            origSocketOffset = ZERO_VEC
+        end
+    end)
 end
 
 local function getActivePlayerController(char)
@@ -761,6 +812,22 @@ local function readViewRotationIntoTbl(view)
     return false
 end
 
+local function runOnGameThread(fn)
+    if IsInGameThread and IsInGameThread() then
+        fn()
+    else
+        SafeExec.executeInGameThread(fn)
+    end
+end
+
+local function scheduleGameThreadDelay(delayMs, fn)
+    if ExecuteInGameThreadWithDelay then
+        pcall(ExecuteInGameThreadWithDelay, delayMs, fn)
+    else
+        SafeExec.executeWithDelay(delayMs, fn)
+    end
+end
+
 local function applyRotationSyncOnGameThread()
     if not fppHeadEnabled or thirdPersonActive or (Hooks.isInCinematic and Hooks.isInCinematic()) then
         return
@@ -786,9 +853,27 @@ local function applyRotationSyncOnGameThread()
         return
     end
 
-    pcall(function()
+    local armAddr = getObjectKey(springArm)
+    rotSyncTickCounter = rotSyncTickCounter + 1
+    if armAddr and armAddr == lastSyncArmAddr and lastSyncPitch ~= nil and lastSyncYaw ~= nil and lastSyncRoll ~= nil then
+        local changed = math.abs(ROT_TBL.Pitch - lastSyncPitch) > 0.002
+            or math.abs(ROT_TBL.Yaw - lastSyncYaw) > 0.002
+            or math.abs(ROT_TBL.Roll - lastSyncRoll) > 0.002
+        if not changed and rotSyncTickCounter < 30 then
+            return
+        end
+    end
+
+    local okRot = pcall(function()
         springArm:K2_SetWorldRotation(ROT_TBL, false, EMPTY_HIT, true)
     end)
+    if okRot then
+        lastSyncArmAddr = armAddr
+        lastSyncPitch = ROT_TBL.Pitch
+        lastSyncYaw = ROT_TBL.Yaw
+        lastSyncRoll = ROT_TBL.Roll
+        rotSyncTickCounter = 0
+    end
 end
 
 local function applyFPPHeadTrackingOnGameThread()
@@ -808,6 +893,8 @@ local function applyFPPHeadTrackingOnGameThread()
     end
     thirdPersonActive = false
 
+    backupSpringArmSettings(springArm)
+
     local curArmParent = nil
     pcall(function()
         curArmParent = springArm:GetAttachParent()
@@ -824,23 +911,24 @@ local function applyFPPHeadTrackingOnGameThread()
 
         pcall(function()
             springArm:K2_AttachToComponent(mesh, FName(HEAD_BONE_NAME), 2, 1, 1, false)
+            springArm:K2_SetRelativeLocation(ZERO_VEC, false, EMPTY_HIT, true)
         end)
     end
 
     pcall(function()
         springArm:SetAbsolute(false, true, true)
-    end)
-    pcall(function()
         springArm.bUsePawnControlRotation = false
-    end)
-    pcall(function()
-        springArm:K2_SetRelativeLocation(ZERO_VEC, false, EMPTY_HIT, true)
+        springArm.bDoCollisionTest = false
+        springArm.bEnableCameraLag = false
+        springArm.bEnableCameraRotationLag = false
+        springArm.SocketOffset = ZERO_VEC
     end)
     pcall(function()
         mesh:HideBoneByName(FName(HEAD_BONE_NAME), 0)
     end)
     setDLCSkinHidden(char, true)
 
+    resetLastSyncRotation()
     applyRotationSyncOnGameThread()
 end
 
@@ -848,7 +936,7 @@ local function applyFPPHeadTracking()
     if not fppHeadEnabled or (Hooks.isInCinematic and Hooks.isInCinematic()) then
         return
     end
-    SafeExec.executeInGameThread(applyFPPHeadTrackingOnGameThread)
+    runOnGameThread(applyFPPHeadTrackingOnGameThread)
 end
 
 local function restoreFPPHeadTrackingOnGameThread()
@@ -864,11 +952,24 @@ local function restoreFPPHeadTrackingOnGameThread()
     syncTrackedCharacter(char, mesh, springArm, view)
     ensureViewUnderRoot(char, view, mesh)
 
+    local armAddr = getObjectKey(springArm)
     pcall(function()
         springArm.bUsePawnControlRotation = false
-    end)
-    pcall(function()
         springArm:SetAbsolute(false, false, false)
+        if armAddr and armAddr == origSpringArmAddr then
+            if origDoCollisionTest ~= nil then
+                springArm.bDoCollisionTest = origDoCollisionTest
+            end
+            if origCameraLag ~= nil then
+                springArm.bEnableCameraLag = origCameraLag
+            end
+            if origCameraRotLag ~= nil then
+                springArm.bEnableCameraRotationLag = origCameraRotLag
+            end
+            if origSocketOffset ~= nil then
+                springArm.SocketOffset = origSocketOffset
+            end
+        end
     end)
 
     local targetParent = nil
@@ -897,6 +998,7 @@ local function restoreFPPHeadTrackingOnGameThread()
         mesh:UnHideBoneByName(FName(HEAD_BONE_NAME))
     end)
     setDLCSkinHidden(char, false)
+    resetLastSyncRotation()
 end
 
 local function maintainFPPHeadTrackingOnGameThread()
@@ -949,10 +1051,14 @@ local function maintainFPPHeadTrackingOnGameThread()
     end
 
     if not needsReapply then
-        local okFlags, absRot, usePawnCtrl = pcall(function()
-            return springArm.bAbsoluteRotation, springArm.bUsePawnControlRotation
+        local okFlags, absRot, usePawnCtrl, doCol, camLag, rotLag = pcall(function()
+            return springArm.bAbsoluteRotation,
+                springArm.bUsePawnControlRotation,
+                springArm.bDoCollisionTest,
+                springArm.bEnableCameraLag,
+                springArm.bEnableCameraRotationLag
         end)
-        if okFlags and (absRot == false or usePawnCtrl == true) then
+        if okFlags and (absRot == false or usePawnCtrl == true or doCol == true or camLag == true or rotLag == true) then
             needsReapply = true
         end
     end
@@ -963,7 +1069,7 @@ local function maintainFPPHeadTrackingOnGameThread()
 end
 
 local function restoreFPPHeadTracking()
-    SafeExec.executeInGameThread(restoreFPPHeadTrackingOnGameThread)
+    runOnGameThread(restoreFPPHeadTrackingOnGameThread)
 end
 
 table.insert(SilentHillOverrides.initFunctions, function(configPath, setCVar, settingsManager)
@@ -984,9 +1090,9 @@ table.insert(SilentHillOverrides.initFunctions, function(configPath, setCVar, se
             else
                 applyFPPHeadTracking()
                 -- Re-apply after 500ms so post-cutscene camera resets do not undo head attachment
-                SafeExec.executeWithDelay(500, function()
+                scheduleGameThreadDelay(500, function()
                     if fppHeadEnabled and not (Hooks.isInCinematic and Hooks.isInCinematic()) then
-                        applyFPPHeadTracking()
+                        applyFPPHeadTrackingOnGameThread()
                     end
                 end)
             end
@@ -1008,53 +1114,47 @@ table.insert(SilentHillOverrides.initFunctions, function(configPath, setCVar, se
         Logger.warn('RegisterKeyBind or Key.F11 unavailable; FPP head toggle keybind skipped')
     end
 
-    SafeExec.executeWithDelay(1500, applyFPPHeadTracking)
+    scheduleGameThreadDelay(1500, applyFPPHeadTrackingOnGameThread)
 
-    -- Discovery, 3rd-person scene detection, and maintenance loop (150 ms)
-    SafeExec.loopAsync(150, function()
+    local function runMaintenanceStep()
         if not fppHeadEnabled then
             return false
         end
-        if maintenanceInFlight then
-            return false
-        end
-
-        maintenanceInFlight = true
-        local scheduled = SafeExec.executeInGameThread(function()
-            local ok, err = pcall(maintainFPPHeadTrackingOnGameThread)
-            maintenanceInFlight = false
-            if not ok then
-                Logger.debug('FPP maintenance error: %s', tostring(err))
-            end
-        end)
-        if not scheduled then
-            maintenanceInFlight = false
+        local ok, err = pcall(maintainFPPHeadTrackingOnGameThread)
+        if not ok then
+            Logger.debug('FPP maintenance error: %s', tostring(err))
         end
         return false
-    end)
+    end
 
-    -- Fast View-to-SpringArm world rotation sync loop (8 ms, struct-property-free)
-    SafeExec.loopAsync(8, function()
+    local function runRotationSyncStep()
         if not fppHeadEnabled or thirdPersonActive or (Hooks.isInCinematic and Hooks.isInCinematic()) then
             return false
         end
-        if rotSyncInFlight or not trackedSpringArm then
+        if not trackedSpringArm then
             return false
         end
-
-        rotSyncInFlight = true
-        local scheduled = SafeExec.executeInGameThread(function()
-            local ok, err = pcall(applyRotationSyncOnGameThread)
-            rotSyncInFlight = false
-            if not ok then
-                Logger.debug('FPP rotation sync error: %s', tostring(err))
-            end
-        end)
-        if not scheduled then
-            rotSyncInFlight = false
+        local ok, err = pcall(applyRotationSyncOnGameThread)
+        if not ok then
+            Logger.debug('FPP rotation sync error: %s', tostring(err))
         end
         return false
-    end)
+    end
+
+    -- Execute both loops directly inside UE4SS EngineTick (GameThread) to avoid LoopAsync lua_State races
+    if LoopInGameThreadWithDelay then
+        LoopInGameThreadWithDelay(150, runMaintenanceStep)
+        LoopInGameThreadWithDelay(1, runRotationSyncStep)
+    else
+        SafeExec.loopAsync(150, function()
+            SafeExec.executeInGameThread(runMaintenanceStep)
+            return false
+        end)
+        SafeExec.loopAsync(16, function()
+            SafeExec.executeInGameThread(runRotationSyncStep)
+            return false
+        end)
+    end
 end)
 
 SilentHillOverrides.earlyInit = false
